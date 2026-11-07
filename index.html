@@ -223,7 +223,9 @@ main{overflow-y:auto;min-height:0;display:flex;flex-direction:column}
         <label for="catIn">Category</label>
         <input type="text" id="catIn" list="catList" autocomplete="off" style="width:170px">
         <datalist id="catList"></datalist>
-        <span id="yearHint" style="font-size:12.5px;color:var(--muted);white-space:nowrap"></span>
+        <!-- Year appeared: filled from the Category when it ends in a year; you can always type over it -->
+        <label for="yearIn">Year appeared</label>
+        <input type="text" id="yearIn" autocomplete="off" style="width:130px" placeholder="e.g. 2019">
         <label for="verSel">Verified</label>
         <select id="verSel"><option value="">— choose —</option><option>Verified</option><option>Not matching</option><option>Unsure</option></select>
         <label for="remarks">Remarks</label>
@@ -426,13 +428,20 @@ const XL = (() => {
 /* ===================================================================== category -> year appeared */
 // Same convention as the workbook: "New in 2019" -> 2019, "Standing in 2016" -> "2016 or earlier",
 // "Not dated" -> "unknown". Any other (custom) category leaves Year appeared untouched (null).
+// Extended rule: "Standing in YYYY" keeps its workbook meaning ("YYYY or earlier").
+// For any other category, the LAST 4-digit year in the text is the year appeared,
+// e.g. "Existing since 2012" -> 2012, "Built in 2021" -> 2021.
 function yearFor(cat){
   const t = String(cat || "").trim();
-  let m = t.match(/^new in (\d{4})$/i); if (m) return +m[1];
-  m = t.match(/^standing in (\d{4})$/i); if (m) return `${m[1]} or earlier`;
   if (/^not dated$/i.test(t)) return "unknown";
+  let m = t.match(/^standing in (\d{4})$/i); if (m) return `${m[1]} or earlier`;
+  const years = t.match(/\b(?:19|20)\d{2}\b/g);           // every year-like number (1900–2099)
+  if (years) return +years[years.length - 1];              // take the last one
   return null;
 }
+// Excel numbers can come back from the file as "2017.0" (written by a Python script).
+// Excel itself shows 2017, so show and compare it the same way.
+const cleanYear = v => { const s = String(v ?? "").trim(); return /^\d+\.0+$/.test(s) ? s.replace(/\.0+$/, "") : s; };
 
 /* ===================================================================== state */
 const HEAD = {id:/^id$/i, category:/^category/i, year:/^year appeared/i, lat:/^latitude/i, lon:/^longitude/i,
@@ -497,7 +506,7 @@ async function parseBook(name){
         if (rn === 1) continue;
         const id = String(c[cols.id] ?? "").trim(); if (!id) continue;
         recs.push({id, sheet:sh.name, row:rn, cols,
-          category:c[cols.category] ?? "", year:c[cols.year] ?? "", lat:c[cols.lat] ?? "", lon:c[cols.lon] ?? "",
+          category:c[cols.category] ?? "", year:cleanYear(c[cols.year]), lat:c[cols.lat] ?? "", lon:c[cols.lon] ?? "",
           coords:c[cols.coords] ?? "", verified:normVer(c[cols.verified]), remarks:c[cols.remarks] ?? "",
           gotoLink:cols.goto ? links[cols.goto + rn] : null, folderLink:cols.folder ? links[cols.folder + rn] : null});
       }
@@ -779,7 +788,8 @@ async function reloadBook(){
 function confirmLeave(){
   if (!S.cur) return true;
   const changed = S.items.length || $("verSel").value !== (S.cur.verified || "") || $("remarks").value !== (S.cur.remarks || "")
-                || $("catIn").value.trim() !== String(S.cur.category || "").trim();
+                || $("catIn").value.trim() !== String(S.cur.category || "").trim()
+                || $("yearIn").value.trim() !== String(S.cur.year || "").trim();
   return !changed || confirm(`You have unsaved changes for ${S.cur.id}. Discard them?`);
 }
 function closeStructure(){
@@ -804,17 +814,19 @@ async function openStructure(id){
   $("noFolder").classList.toggle("hidden", !!S.dir);
   $("noFolder").textContent = S.dir ? "" : `No folder named "${rec.id}" was found inside the main folder, so screenshots and the PDF can't be saved for this one. Verified and Remarks will still be written to Excel.`;
   $("gallery").classList.toggle("hidden", !S.dir);
-  setVer(rec.verified); $("remarks").value = rec.remarks || ""; $("catIn").value = rec.category || ""; showYearHint();
+  setVer(rec.verified); $("remarks").value = rec.remarks || ""; $("catIn").value = rec.category || "";
+  $("yearIn").value = rec.year || ""; S.yearTyped = false;          // fresh structure: year not hand-edited yet
   document.querySelectorAll(".row").forEach(el => el.classList.toggle("sel", el.dataset.id === id));
   status("", S.dir ? HINT : "Choose <b>Verified</b>, add a remark if you like, then click <b>Done</b>.");
   await refreshThumbs();
 }
+// Runs while you type in Category. Fills Year appeared from it — unless you've typed a year
+// by hand for this structure, in which case your value is left alone.
 function showYearHint(){
-  if (!S.cur) return;
+  if (!S.cur || S.yearTyped) return;
   const cat = $("catIn").value.trim(), changed = cat !== String(S.cur.category || "").trim();
   const y = yearFor(cat);
-  $("yearHint").innerHTML = !changed ? `Year appeared: <b>${esc(S.cur.year || "—")}</b>`
-    : y != null ? `Year appeared → <b>${esc(y)}</b>` : `Year appeared stays <b>${esc(S.cur.year || "—")}</b>`;
+  $("yearIn").value = changed && y != null ? String(y) : (S.cur.year || "");
 }
 function setVer(v){ $("verSel").value = ["Verified","Not matching","Unsure"].includes(v) ? v : ""; $("verSel").className = DOT[$("verSel").value] || ""; }
 
@@ -910,10 +922,23 @@ function renderItems(){
     el.querySelector(".pic img").src = it.url;
     el.querySelector(".rm").onclick = () => removeItem(it.id);
     const inp = el.querySelector("input"); inp.value = it.date;
-    inp.onchange = ev => { it.date = ev.target.value; renderItems(); itemsStatus(); };
+    // Don't rebuild the cards while you type: Chrome fires "change" after each part of the date,
+    // and a rebuild re-sorts the cards by date, so the one you were typing in jumped away.
+    // Only this card's highlight and the file-name labels are updated; the order catches up
+    // the next time a screenshot is added or removed (file names don't depend on card order).
+    inp.onchange = ev => { it.date = ev.target.value; ev.target.classList.toggle("need", !it.date); updateNames(); itemsStatus(); };
+    el.querySelector(".fname").dataset.fname = it.id;
     grid.appendChild(el);
     if (String(it.id) === focusId) inp.focus();
   }
+}
+// Refresh only the "file name" labels under each card, without rebuilding the cards.
+function updateNames(){
+  const nm = plannedNames([]);
+  document.querySelectorAll("#grid .fname[data-fname]").forEach(el => {
+    const fn = nm.get(+el.dataset.fname);
+    el.textContent = fn || "Waiting for a date"; el.classList.toggle("none", !fn);
+  });
 }
 function itemsStatus(){
   if (!S.items.length){ status("", HINT); return; }
@@ -1016,7 +1041,10 @@ async function done(){
   $("doneBtn").disabled = true;
   try{
     status("warn", "Saving to Excel…");
-    const newYear = category !== String(rec.category || "").trim() ? yearFor(category) : null;
+    // Year appeared = whatever is in the box. Written only if it differs from Excel.
+    // A plain year (2012) is saved as a number, anything else ("2016 or earlier") as text.
+    const yearTxt = $("yearIn").value.trim();
+    const newYear = yearTxt !== String(rec.year || "").trim() ? (/^\d{4}$/.test(yearTxt) ? +yearTxt : yearTxt) : null;
     try{ await writeExcel(rec, verified, remarks, category, newYear); }
     catch(e){ status("err", `Couldn't save to <b>${esc(S.wb.name)}</b> (${esc(e.message)}). If it's open in Excel, close it and click <b>Done</b> again — nothing you entered here is lost.`); return; }
     const catChanged = category !== String(rec.category || "").trim();
@@ -1074,6 +1102,7 @@ $("meTxt").onclick = async () => { const n = (prompt("Your name — shown to col
 $("sWeb").onclick = () => S.cur && webTo(S.cur);
 $("verSel").onchange = () => setVer($("verSel").value);
 $("catIn").oninput = showYearHint;
+$("yearIn").oninput = () => { S.yearTyped = true; };   // you typed a year: stop auto-filling it
 $("doneBtn").onclick = done;
 $("addBtn").onclick = () => $("fileIn").click();
 $("fileIn").onchange = ev => { addImages(ev.target.files); ev.target.value = ""; };
