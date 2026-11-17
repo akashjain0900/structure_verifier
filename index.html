@@ -65,6 +65,12 @@ aside{background:var(--side);border-right:1px solid var(--line);display:flex;fle
 .side-head .wbrow{display:flex;gap:8px;align-items:center}
 .side-head .wbrow select{flex:1}
 .btn.icon{padding:8px 10px}
+/* ⋯ menu in the top bar */
+.more{position:relative;margin-left:8px}
+.top .more .btn.icon{font-size:18px;line-height:1;padding:6px 12px}
+.moremenu{position:absolute;right:0;top:calc(100% + 6px);z-index:50;background:var(--card);border:1px solid var(--line);border-radius:10px;box-shadow:var(--shadow);padding:6px}
+.moremenu button{display:block;width:100%;text-align:left;font:inherit;font-size:14px;color:var(--ink);background:none;border:0;border-radius:8px;padding:9px 12px;cursor:pointer;white-space:nowrap}
+.moremenu button:hover{background:var(--brand-soft);color:var(--brand)}
 .me{font-size:12px;color:var(--muted);cursor:pointer;white-space:nowrap;max-width:140px;overflow:hidden;text-overflow:ellipsis}
 .me:hover{color:var(--brand)}
 .progress{font-size:12.5px;color:var(--muted)}
@@ -158,6 +164,11 @@ main{overflow-y:auto;min-height:0;display:flex;flex-direction:column}
   <div><h1>Structure Verifier</h1><p id="topSub">Screenshots, verification and a PDF for every structure</p></div>
   <span class="sp"></span>
   <button class="btn hidden" id="changeRoot">Change main folder</button>
+  <!-- ⋯ menu: rarely needed actions -->
+  <div class="more hidden" id="moreWrap">
+    <button class="btn icon" id="moreBtn" title="More" aria-haspopup="true">⋯</button>
+    <div class="moremenu hidden" id="moreMenu"><button id="mergeBtn" title="Copy every colleague's saved results into the Excel file">Merge results into Excel now</button></div>
+  </div>
 </div></header>
 
 <!-- start -->
@@ -246,15 +257,22 @@ const DateReader = (() => {
   let workerP = null;
   const MON = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
   function worker(){ if (!workerP) workerP = Tesseract.createWorker("eng"); return workerP; }
+  // Google Earth always prints "Imagery Date: …" at the bottom right, so only that corner is read:
+  // the right part of the image (from LEFT_FRAC of the width) × the bottom `frac` of the height.
+  // In a normal screenshot the date starts ~63% of the way across; 40% leaves a wide margin
+  // for screenshots drawn a little narrower or wider.
+  const LEFT_FRAC = 0.40;
   async function band(bmp, frac, scale){
-    const h = Math.min(bmp.height, Math.max(28, Math.round(bmp.height * frac)));
-    const c = document.createElement("canvas"); c.width = Math.round(bmp.width * scale); c.height = Math.round(h * scale);
+    const h = Math.min(bmp.height, Math.max(40, Math.round(bmp.height * frac)));
+    const left = Math.round(bmp.width * LEFT_FRAC), w = bmp.width - left;
+    const c = document.createElement("canvas"); c.width = Math.round(w * scale); c.height = Math.round(h * scale);
     const g = c.getContext("2d"); g.imageSmoothingQuality = "high";
-    g.drawImage(bmp, 0, bmp.height - h, bmp.width, h, 0, 0, c.width, c.height);
+    g.drawImage(bmp, left, bmp.height - h, w, h, 0, 0, c.width, c.height);
+    // greyscale helps Tesseract read the small white-on-dark status bar text
     const im = g.getImageData(0, 0, c.width, c.height), d = im.data;
     for (let i = 0; i < d.length; i += 4){ const y = 0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2]; d[i] = d[i+1] = d[i+2] = y; }
     g.putImageData(im, 0, 0);
-    return {canvas:c, top:bmp.height - h, scale};
+    return {canvas:c, top:bmp.height - h, left, scale};
   }
   function iso(y, m, d){
     const dt = new Date(Date.UTC(y, m - 1, d));
@@ -292,7 +310,8 @@ const DateReader = (() => {
   async function read(blob){
     const bmp = await createImageBitmap(blob);
     const w = await worker();
-    for (const [frac, scale] of [[0.035, 3], [0.07, 2.5], [0.14, 2]]){
+    // two tries on the bottom-right corner: a thin strip first (fast), then a taller one
+    for (const [frac, scale] of [[0.06, 3], [0.12, 2.5]]){
       const b = await band(bmp, frac, scale);
       const { data } = await w.recognize(b.canvas, {}, {text:true, blocks:true});
       const hit = parse(data.text);
@@ -301,8 +320,9 @@ const DateReader = (() => {
       const box = findBox(data.blocks, hit.raw);
       if (box){
         const pad = 6;
-        const x0 = Math.max(0, box.x0 / scale - pad), y0 = Math.max(0, b.top + box.y0 / scale - pad);
-        const x1 = Math.min(bmp.width, box.x1 / scale + pad), y1 = Math.min(bmp.height, b.top + box.y1 / scale + pad);
+        // box is in corner-canvas pixels: scale back down and shift by the corner's left/top
+        const x0 = Math.max(0, b.left + box.x0 / scale - pad), y0 = Math.max(0, b.top + box.y0 / scale - pad);
+        const x1 = Math.min(bmp.width, b.left + box.x1 / scale + pad), y1 = Math.min(bmp.height, b.top + box.y1 / scale + pad);
         const c = document.createElement("canvas"); c.width = Math.round((x1 - x0) * 2); c.height = Math.round((y1 - y0) * 2);
         c.getContext("2d").drawImage(bmp, x0, y0, x1 - x0, y1 - y0, 0, 0, c.width, c.height);
         crop = c.toDataURL("image/png");
@@ -486,7 +506,7 @@ async function useRoot(h){
   $("wbSel").innerHTML = files.map(f => `<option>${esc(f)}</option>`).join("");
   const last = lsGet("sv-wb:" + h.name);
   $("wbSel").value = files.includes(last) ? last : files[0];
-  $("startView").classList.add("hidden"); $("appView").classList.remove("hidden"); $("changeRoot").classList.remove("hidden");
+  $("startView").classList.add("hidden"); $("appView").classList.remove("hidden"); $("changeRoot").classList.remove("hidden"); $("moreWrap").classList.remove("hidden");
   $("topSub").textContent = h.name;
   warmReader();
   return await loadWorkbook($("wbSel").value);
@@ -770,63 +790,116 @@ async function rebuildKml(){
   status("ok", `KML updated from Excel: ${done.map(f => `KML\\${esc(f)}`).join(", ")}. In Google Earth Pro, right-click that layer and choose <b>Revert</b> to see it.`);
 }
 
-/* ===================================================================== in-use lock (shared folders) */
-// A small note next to the workbook says who is working on that village. It is refreshed every few
-// minutes; a note not refreshed for 20 minutes is treated as left over (closed page or crash).
+/* ===================================================================== working together (shared folders) */
+// Several people can work on the same village at once. Two kinds of small files sit next to the workbook:
+//
+//  1. "<workbook> - in use - <name> (<id>).txt"  — who is working here right now (refreshed every 4 minutes;
+//     one not refreshed for 20 minutes is treated as left over). Only shown as a note; it never blocks anyone.
+//  2. "<workbook> - results - <name> (<id>).json" — every result this person has saved with Done.
+//     Only that person's browser writes it, so it can never be overwritten by a colleague or a Drive sync clash.
+//
+// The Excel file is the shared copy everyone reads. On every Done, every Reload and "Merge now", all
+// results files are merged into it (see mergeResults). <id> is a short random code kept in this browser,
+// so two colleagues with the same name still get separate files.
 const LOCK_STALE = 20 * 60 * 1000;
-S.me = lsGet("sv-name") || ""; S.token = Math.random().toString(36).slice(2) + Date.now().toString(36); S.lockName = null;
-const lockFile = wb => `${wb} - in use.txt`;
+S.me = lsGet("sv-name") || "";
+S.myId = lsGet("sv-id") || Math.random().toString(36).slice(2, 6); lsSet("sv-id", S.myId);
+S.lockName = null;
+const meTag = () => `${safeName(S.me || "A colleague")} (${S.myId})`;
+const presenceFile = wb => `${wb} - in use - ${meTag()}.txt`;
+const resultsFile  = wb => `${wb} - results - ${meTag()}.json`;
 function showMe(){ $("meTxt").textContent = `You: ${S.me || "—"} ✎`; }
-async function readLock(wb){
-  try{ const t = await (await (await S.root.getFileHandle(lockFile(wb))).getFile()).text(); const m = JSON.parse(t); return m && m.token ? m : null; }
-  catch(e){ return null; }
-}
-async function writeLock(wb){
-  const body = JSON.stringify({name:S.me, token:S.token, since:S.lockSince || Date.now(), beat:Date.now(),
-    note:"Written by Structure Verifier while someone is working on this village. Safe to delete if nobody is."}, null, 1);
-  const w = await (await S.root.getFileHandle(lockFile(wb), {create:true})).createWritable(); await w.write(body); await w.close();
-}
 const ago = ms => { const m = Math.round(ms / 60000); return m < 1 ? "just now" : m < 60 ? `${m} min ago` : `${Math.round(m / 60)} h ago`; };
 const hhmm = t => new Date(t).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"});
-async function claimLock(wb){
-  const m = await readLock(wb);
-  if (m && m.token !== S.token && Date.now() - m.beat < LOCK_STALE){
-    const ok = confirm(`${m.name} is working on ${wb} (since ${hhmm(m.since)}, last active ${ago(Date.now() - m.beat)}).\n\n`
-      + `If you both work on the same village, one person's marks can overwrite the other's.\n\nTake over this village anyway?`);
-    if (!ok){
-      $("lockNote").textContent = `${m.name} is working on this village. Pick another workbook, or reopen this one to take over.`;
-      $("lockNote").classList.remove("hidden"); return false;
-    }
+
+// Read every file next to the workbook whose name starts with "<workbook> - <kind> - " (kind = "in use" or "results").
+async function readSideFiles(wb, kind, ext){
+  const pre = `${wb} - ${kind}`.toLowerCase(), out = [];
+  for await (const [name, h] of S.root.entries()){
+    const low = name.toLowerCase();
+    if (h.kind !== "file" || !low.startsWith(pre) || !low.endsWith(ext)) continue;
+    try{ out.push({name, data: JSON.parse(await (await h.getFile()).text())}); }catch(e){}   // half-synced or damaged file: skip it
   }
-  S.lockSince = Date.now(); S.lockName = wb; S.lockLost = null;
-  try{ await writeLock(wb); }catch(e){}
-  $("lockNote").classList.add("hidden");
+  return out;
+}
+async function writePresence(wb){
+  const body = JSON.stringify({name:S.me, id:S.myId, beat:Date.now(),
+    note:"Written by Structure Verifier while this person has the village open. Safe to delete if they don't."}, null, 1);
+  const w = await (await S.root.getFileHandle(presenceFile(wb), {create:true})).createWritable(); await w.write(body); await w.close();
+}
+// Show "Also working on this village: …" for colleagues active in the last 20 minutes.
+async function showOthers(wb){
+  let others = [];
+  try{
+    others = (await readSideFiles(wb, "in use", ".txt")).map(f => f.data)
+      .filter(m => m && m.beat && Date.now() - m.beat < LOCK_STALE && !(m.id === S.myId));
+  }catch(e){}
+  if (others.length){
+    $("lockNote").textContent = "Also working on this village: " + others.map(m => `${m.name || "a colleague"} (active ${ago(Date.now() - m.beat)})`).join(", ")
+      + ". Stick to your own range of structures.";
+    $("lockNote").classList.remove("hidden");
+  } else $("lockNote").classList.add("hidden");
+}
+async function claimLock(wb){        // name kept from the old version; it no longer blocks anyone
+  S.lockName = wb;
+  try{ await writePresence(wb); }catch(e){}
+  await showOthers(wb);
   return true;
 }
 async function releaseLock(){
   if (!S.lockName || !S.root) return;
-  const m = await readLock(S.lockName);
-  if (m && m.token === S.token){ try{ await S.root.removeEntry(lockFile(S.lockName)); }catch(e){} }
+  try{ await S.root.removeEntry(presenceFile(S.lockName)); }catch(e){}
   S.lockName = null;
-}
-// returns null if still ours, else the colleague's lock note
-async function lockTakenBy(){
-  if (!S.lockName) return null;
-  const m = await readLock(S.lockName);
-  return m && m.token !== S.token && Date.now() - m.beat < LOCK_STALE ? m : null;
 }
 async function heartbeat(){
   if (!S.lockName) return;
-  const other = await lockTakenBy();
-  if (other){
-    S.lockLost = other;
-    $("lockNote").textContent = `${other.name} took over this village at ${hhmm(other.since)}. Your Done is paused so you don't overwrite each other — talk to them, then reopen the workbook.`;
-    $("lockNote").classList.remove("hidden"); return;
-  }
-  try{ await writeLock(S.lockName); }catch(e){}
+  try{ await writePresence(S.lockName); }catch(e){}
+  await showOthers(S.lockName);
 }
 setInterval(heartbeat, 4 * 60 * 1000);
-window.addEventListener("pagehide", () => { if (S.lockName){ readLock(S.lockName).then(m => { if (m && m.token === S.token) S.root.removeEntry(lockFile(S.lockName)).catch(() => {}); }); } });
+window.addEventListener("pagehide", () => { if (S.lockName && S.root) S.root.removeEntry(presenceFile(S.lockName)).catch(() => {}); });
+
+// Add one result to this person's results file (read it, change one entry, write it back).
+async function saveMyResult(wb, rec, r){
+  let data = {name:S.me, id:S.myId, workbook:wb, results:{}};
+  try{ const old = JSON.parse(await (await (await S.root.getFileHandle(resultsFile(wb))).getFile()).text()); if (old && old.results) data.results = old.results; }catch(e){}
+  data.results[rec.id] = {sheet:rec.sheet, verified:r.verified, remarks:r.remarks, category:r.category, year:r.year, savedAt:Date.now()};
+  const w = await (await S.root.getFileHandle(resultsFile(wb), {create:true})).createWritable();
+  await w.write(JSON.stringify(data, null, 1)); await w.close();
+}
+// Everyone's results for this workbook, newest per structure: Map id -> {sheet, verified, remarks, category, year, savedAt, by}
+async function allResults(wb){
+  const best = new Map();
+  for (const f of await readSideFiles(wb, "results", ".json")){
+    const res = f.data && f.data.results; if (!res) continue;
+    for (const [id, r] of Object.entries(res)){
+      if (!r || !r.verified) continue;
+      const cur = best.get(id);
+      if (!cur || (r.savedAt || 0) > (cur.savedAt || 0)) best.set(id, {...r, by:f.data.name || "a colleague"});
+    }
+  }
+  return best;
+}
+// Which results are missing from Excel? Only rows whose Verified cell is EMPTY are filled — that is what a lost
+// save looks like. A row that already has a value is never changed, so a correction typed into Excel stays.
+function missingFromExcel(recs, results){
+  const fill = [];
+  for (const rec of recs){ const r = results.get(rec.id); if (r && !rec.verified) fill.push({rec, r}); }
+  return fill;
+}
+// Merge everyone's results into the Excel file. Returns how many rows were filled (0 = already up to date).
+// Writes Excel only when something is missing; skips (with a note) if the workbook is open in Excel.
+async function mergeResults(){
+  const wb = S.wb.name, results = await allResults(wb);
+  const recs = await parseBook(wb);
+  const fill = missingFromExcel(recs, results);
+  if (fill.length){
+    if (await exists(S.root, "~$" + wb)) return {filled:0, recs, results, blocked:true};
+    await writeRows(fill.map(({rec, r}) => ({rec, verified:r.verified, remarks:r.remarks ?? "", category:r.category ?? "", year:r.year ?? null})));
+    for (const {rec, r} of fill) Object.assign(rec, {verified:r.verified, remarks:r.remarks ?? "", category:r.category || rec.category, year:r.year != null ? String(r.year) : rec.year});
+  }
+  return {filled:fill.length, recs, results, blocked:false};
+}
 
 function syncRecs(recs){
   for (const r of recs){
@@ -839,10 +912,25 @@ async function reloadBook(){
   if (!S.wb) return;
   const keep = S.cur && S.cur.id;
   if (!confirmLeave()) return;
-  try{ const recs = await parseBook(S.wb.name); syncRecs(recs); }catch(e){ status("err", `Couldn't reload: ${esc(e.message)}`); return; }
+  // merge everyone's results into Excel first, then show what's there
+  let m;
+  try{ m = await mergeResults(); syncRecs(m.recs); }catch(e){ status("err", `Couldn't reload: ${esc(e.message)}`); return; }
   await indexFolders();
+  if (S.lockName) await showOthers(S.lockName);
   if (keep){ S.cur = null; await openStructure(keep); }
-  status("ok", "Reloaded from the folder — colleagues' latest marks are shown.");
+  status(m.blocked ? "warn" : "ok", "Reloaded from the folder — colleagues' latest marks are shown."
+    + (m.filled ? ` ${m.filled} result${m.filled > 1 ? "s" : ""} merged into Excel.` : "")
+    + (m.blocked ? ` Some results aren't in Excel yet because <b>${esc(S.wb.name)}</b> is open in Excel — close it and click Reload again.` : ""));
+}
+// "Merge now" (⋯ menu): the same merge on demand, e.g. before sending the Excel file to someone.
+async function mergeNow(){
+  if (!S.wb){ status("err", "Open a workbook first."); return; }
+  status("warn", "Merging everyone's results into Excel…");
+  let m;
+  try{ m = await mergeResults(); syncRecs(m.recs); }catch(e){ status("err", `Couldn't merge: ${esc(e.message)}`); return; }
+  if (m.blocked) status("err", `<b>${esc(S.wb.name)}</b> is open in Excel — close it, then click Merge now again.`);
+  else status("ok", m.filled ? `Merged ${m.filled} result${m.filled > 1 ? "s" : ""} into <b>${esc(S.wb.name)}</b> (from ${new Set([...m.results.values()].map(r => r.by)).size} people's results files).`
+                             : `<b>${esc(S.wb.name)}</b> already has everyone's results — nothing to merge.`);
 }
 
 /* ===================================================================== structure view */
@@ -1023,22 +1111,35 @@ async function asStored(blob){
 }
 async function exists(dir, name){ try{ await dir.getFileHandle(name); return true; }catch(e){ return false; } }
 
-async function writeExcel(rec, verified, remarks, category, year){
+// Write one structure's result into the Excel file (used by Done; may carry extra rows from mergeResults).
+async function writeExcel(rec, verified, remarks, category, year, extra = []){
+  await writeRows([{rec, verified, remarks, category, year}, ...extra]);
+}
+// Write several rows in ONE read-modify-write of the Excel file.
+// Each update: {rec, verified, remarks, category, year}. year null = leave the Year cell alone.
+// The file is read fresh right before writing, so edits made in Excel (or by colleagues) are kept.
+async function writeRows(updates){
   const fh = await S.root.getFileHandle(S.wb.name);
-  const book = await XL.open(await (await fh.getFile()).arrayBuffer());     // fresh copy: keeps any edits made in Excel
-  const sh = book.sheets.find(s => s.name === rec.sheet); if (!sh) throw new Error(`Sheet "${rec.sheet}" is no longer in the workbook`);
-  let xml = await book.zip.file(sh.path).async("string");
-  const rows = XL.readRows(xml, book.shared);
-  const head = rows.get(1) || {}, cols = {};
-  for (const [col, txt] of Object.entries(head)) for (const [k, re] of Object.entries(HEAD)) if (!cols[k] && re.test(String(txt).trim())) cols[k] = col;
-  if (!cols.id || !cols.verified || !cols.remarks) throw new Error("The ID / Verified / Remarks columns were not found");
-  let rn = null; for (const [n, c] of rows) if (n > 1 && String(c[cols.id] ?? "").trim() === rec.id){ rn = n; break; }
-  if (!rn) throw new Error(`${rec.id} is no longer in the "${rec.sheet}" sheet`);
-  const vals = {[cols.verified]: verified, [cols.remarks]: remarks};
-  if (cols.category && category) vals[cols.category] = category;
-  if (cols.year && year != null) vals[cols.year] = year;
-  xml = XL.setCells(xml, rn, vals);
-  book.zip.file(sh.path, xml);
+  const book = await XL.open(await (await fh.getFile()).arrayBuffer());
+  for (const sheet of [...new Set(updates.map(u => u.rec.sheet))]){
+    const sh = book.sheets.find(s => s.name === sheet); if (!sh) throw new Error(`Sheet "${sheet}" is no longer in the workbook`);
+    let xml = await book.zip.file(sh.path).async("string");
+    const rows = XL.readRows(xml, book.shared);
+    const head = rows.get(1) || {}, cols = {};
+    for (const [col, txt] of Object.entries(head)) for (const [k, re] of Object.entries(HEAD)) if (!cols[k] && re.test(String(txt).trim())) cols[k] = col;
+    if (!cols.id || !cols.verified || !cols.remarks) throw new Error("The ID / Verified / Remarks columns were not found");
+    const rowOf = new Map(); for (const [n, c] of rows) if (n > 1){ const id = String(c[cols.id] ?? "").trim(); if (id && !rowOf.has(id)) rowOf.set(id, n); }
+    for (const u of updates.filter(u => u.rec.sheet === sheet)){
+      const rn = rowOf.get(u.rec.id);
+      if (!rn) throw new Error(`${u.rec.id} is no longer in the "${sheet}" sheet`);
+      const vals = {[cols.verified]: u.verified, [cols.remarks]: u.remarks};
+      if (cols.category && u.category) vals[cols.category] = u.category;
+      if (cols.year && u.year != null) vals[cols.year] = u.year;
+      xml = XL.setCells(xml, rn, vals);
+      u.rec.row = rn;
+    }
+    book.zip.file(sh.path, xml);
+  }
   const wbXml = await book.zip.file("xl/workbook.xml").async("string");
   book.zip.file("xl/workbook.xml", XL.recalcOnOpen(wbXml));
   const out = await book.zip.generateAsync({type:"blob", compression:"DEFLATE", compressionOptions:{level:6},
@@ -1046,7 +1147,6 @@ async function writeExcel(rec, verified, remarks, category, year){
   const w = await fh.createWritable();
   try{ await w.write(out); await w.close(); }
   catch(e){ try{ await w.abort(); }catch(_){} throw e; }
-  rec.row = rn;
 }
 
 /* PDF: one page per dated screenshot. Each page is exactly the screenshot's size (1 image pixel = 1/96 inch),
@@ -1089,8 +1189,8 @@ async function done(){
   if (missing){ status("err", `Add the imagery date for ${missing} screenshot${missing > 1 ? "s" : ""} first.`); return; }
   // Excel open? (Excel leaves a "~$" lock file next to the workbook)
   if (await exists(S.root, "~$" + S.wb.name)){ status("err", `<b>${esc(S.wb.name)}</b> is open in Excel — on this computer or a colleague's. Close it, then click <b>Done</b> again — nothing you entered here is lost.`); return; }
-  const other = await lockTakenBy();
-  if (other){ status("err", `<b>${esc(other.name)}</b> took over this village at ${hhmm(other.since)}, so this wasn't saved (to avoid overwriting each other). Nothing you entered here is lost — agree who continues, then reopen the workbook.`); return; }
+  // the list order as you see it now — "next" is the next unchecked structure BELOW this one
+  const order = visible().map(r => r.id);
   // planned file names, and a check before replacing anything
   const existing = (await datedFiles()).map(f => f[0]);
   const nm = plannedNames(existing), list = sortedItems().map(it => [it, nm.get(it.id)]);
@@ -1106,11 +1206,21 @@ async function done(){
     // A plain year (2012) is saved as a number, anything else ("2016 or earlier") as text.
     const yearTxt = $("yearIn").value.trim();
     const newYear = yearTxt !== String(rec.year || "").trim() ? (/^\d{4}$/.test(yearTxt) ? +yearTxt : yearTxt) : null;
-    try{ await writeExcel(rec, verified, remarks, category, newYear); }
+    // 1) your own results file first: from here on this result can't be lost, even if a Drive sync clash
+    //    later overwrites the Excel file
+    try{ await saveMyResult(S.wb.name, rec, {verified, remarks, category, year:newYear}); }
+    catch(e){ status("err", `Couldn't save your results file (${esc(e.message)}). Click <b>Done</b> again — nothing you entered here is lost.`); return; }
+    // 2) colleagues' results that the Excel file is missing (a lost save) go into the same Excel write
+    let fill = [];
+    try{ fill = missingFromExcel(await parseBook(S.wb.name), await allResults(S.wb.name)).filter(f => f.rec.id !== rec.id); }catch(e){}
+    const extra = fill.map(({rec:x, r}) => ({rec:x, verified:r.verified, remarks:r.remarks ?? "", category:r.category ?? "", year:r.year ?? null}));
+    try{ await writeExcel(rec, verified, remarks, category, newYear, extra); }
     catch(e){ status("err", `Couldn't save to <b>${esc(S.wb.name)}</b> (${esc(e.message)}). If it's open in Excel, close it and click <b>Done</b> again — nothing you entered here is lost.`); return; }
+    // the list shows the merged rows as checked too, so "next" skips structures a colleague already did
+    for (const {rec:x, r} of fill){ const cur = S.byId.get(x.id); if (cur) Object.assign(cur, {verified:r.verified, remarks:r.remarks ?? "", category:r.category || cur.category, year:r.year != null ? String(r.year) : cur.year}); }
     const catChanged = category !== String(rec.category || "").trim();
     rec.verified = verified; rec.remarks = remarks; rec.category = category;
-    try{ await writeLock(S.lockName); }catch(e){}
+    try{ await writePresence(S.lockName); }catch(e){}
     if (newYear != null) rec.year = String(newYear);
 
     let saved = 0;
@@ -1130,11 +1240,16 @@ async function done(){
     const parts = [`Excel updated (${esc(verified)}${catChanged ? `, category → ${esc(category)}` : ""}${newYear != null ? `, year appeared → ${esc(newYear)}` : ""})`];
     if (saved) parts.push(`${saved} screenshot${saved > 1 ? "s" : ""} saved`);
     if (pdf) parts.push(`${esc(pdf)} made`);
+    if (fill.length) parts.push(`${fill.length} earlier result${fill.length > 1 ? "s" : ""} that Excel had lost restored`);
     const msg = `✓ ${esc(rec.id)}: ` + parts.join(" · ") + ".";
-    const next = visible().find(r => !r.verified && r.id !== rec.id);
+    // next unchecked structure BELOW this one in the list — never jumps back up to a colleague's range
+    // (if this structure wasn't in the visible list, e.g. hidden by a search, use the full list order)
+    const ids = order.includes(rec.id) ? order : S.recs.map(r => r.id);
+    const below = ids.slice(ids.indexOf(rec.id) + 1).map(id => S.byId.get(id));
+    const next = below.find(r => r && !r.verified);
     if (next){ await openStructure(next.id); status("ok", msg + ` Now on <b>${esc(next.id)}</b>.`);
       document.querySelector(`.row[data-id="${CSS.escape(next.id)}"]`)?.scrollIntoView({block:"nearest"}); }
-    else status("ok", msg + " That was the last unchecked one in this list.");
+    else status("ok", msg + " No unchecked structures below this one in the list.");
   }catch(e){
     status("err", "Something went wrong: " + esc(e.message) + ". Excel was already updated; click <b>Done</b> again to retry the rest.");
     await refreshThumbs();
@@ -1157,10 +1272,13 @@ $("list").onclick = ev => {
 };
 $("sFly").onclick = () => S.cur && flyTo(S.cur);
 $("reloadBtn").onclick = reloadBook;
+$("moreBtn").onclick = ev => { ev.stopPropagation(); $("moreMenu").classList.toggle("hidden"); };
+document.addEventListener("click", () => $("moreMenu").classList.add("hidden"));   // click anywhere else closes the ⋯ menu
+$("mergeBtn").onclick = () => { $("moreMenu").classList.add("hidden"); mergeNow(); };
 $("kmlBtn").onclick = () => { if (S.wb) rebuildKml(); };
 $("kmlDlBtn").onclick = () => { if (S.wb) downloadMasterKml(); };
 $("meTxt").onclick = async () => { const n = (prompt("Your name — shown to colleagues while you're working on a village:", S.me) || "").trim();
-  if (n){ S.me = n; lsSet("sv-name", n); showMe(); if (S.lockName) try{ await writeLock(S.lockName); }catch(e){} } };
+  if (n){ S.me = n; lsSet("sv-name", n); showMe(); if (S.lockName) try{ await writePresence(S.lockName); }catch(e){} } };
 $("sWeb").onclick = () => S.cur && webTo(S.cur);
 $("verSel").onchange = () => setVer($("verSel").value);
 $("catIn").oninput = showYearHint;
@@ -1180,7 +1298,7 @@ gal.addEventListener("drop", ev => { ev.preventDefault(); gal.classList.remove("
 document.addEventListener("keydown", ev => { if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "s"){ ev.preventDefault(); if (S.cur) done(); } });
 window.addEventListener("beforeunload", ev => { if (S.items.length){ ev.preventDefault(); ev.returnValue = ""; } });
 if (!("showDirectoryPicker" in window)){ showStartErr("This browser can't save into folders. Please open this file in Google Chrome or Microsoft Edge."); $("pickRoot").disabled = true; }
-window.__test = { useRoot, openStructure, done, flyTo, flyKml, rebuildKml, heartbeat, releaseLock, addImages, S, XL };   // used only by automated tests
+window.__test = { useRoot, openStructure, done, flyTo, flyKml, rebuildKml, heartbeat, releaseLock, addImages, mergeResults, mergeNow, reloadBook, S, XL };   // used only by automated tests
 </script>
 </body>
 </html>
