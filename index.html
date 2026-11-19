@@ -545,6 +545,8 @@ async function loadWorkbook(name, opts = {}){
   $("list").innerHTML = `<div class="nores"><span class="spin" style="display:inline-block"></span><br>Reading ${esc(name)}…</div>`;
   try{
     const recs = await parseBook(name);
+    // show results colleagues saved to their results files but that aren't in Excel yet (display only)
+    try{ const res = await allResults(name); for (const {rec, r} of missingFromExcel(recs, res)) Object.assign(rec, {verified:r.verified, remarks:r.remarks ?? "", category:r.category || rec.category, year:r.year != null ? String(r.year) : rec.year}); }catch(e){}
     if (!recs.length){ $("list").innerHTML = `<div class="nores">No structure sheet found in ${esc(name)}.<br>It needs columns named ID, Verified and Remarks.</div>`; return false; }
     S.wb = {name, sheets:[...new Set(recs.map(r => r.sheet))]}; S.recs = recs; recs.forEach(r => S.byId.set(r.id, r));
     lsSet("sv-wb:" + S.root.name, name);
@@ -822,42 +824,62 @@ async function readSideFiles(wb, kind, ext){
   }
   return out;
 }
-async function writePresence(wb){
-  const body = JSON.stringify({name:S.me, id:S.myId, beat:Date.now(),
+// Presence file: {name, id, beat, left}. "left:true" is written when someone closes the village,
+// so the others keep counting them for LEAVE_GRACE while their last Excel save finishes syncing.
+const LEAVE_GRACE = 3 * 60 * 1000;
+async function writePresence(wb, left = false){
+  const body = JSON.stringify({name:S.me, id:S.myId, beat:Date.now(), left,
     note:"Written by Structure Verifier while this person has the village open. Safe to delete if they don't."}, null, 1);
   const w = await (await S.root.getFileHandle(presenceFile(wb), {create:true})).createWritable(); await w.write(body); await w.close();
 }
-// Show "Also working on this village: …" for colleagues active in the last 20 minutes.
-async function showOthers(wb){
-  let others = [];
+// Colleagues who count as "here": still working (refreshed in the last 20 minutes),
+// or left less than 3 minutes ago. While anyone is here, this computer does NOT write the main
+// Excel file — two computers writing it is what makes Google Drive save copies in My Drive.
+async function othersHere(wb){
   try{
-    others = (await readSideFiles(wb, "in use", ".txt")).map(f => f.data)
-      .filter(m => m && m.beat && Date.now() - m.beat < LOCK_STALE && !(m.id === S.myId));
-  }catch(e){}
+    return (await readSideFiles(wb, "in use", ".txt")).map(f => f.data)
+      .filter(m => m && m.beat && m.id !== S.myId
+        && (m.left ? Date.now() - m.beat < LEAVE_GRACE : Date.now() - m.beat < LOCK_STALE));
+  }catch(e){ return []; }
+}
+// Show "Also working on this village: …" and return the list.
+async function showOthers(wb){
+  const others = await othersHere(wb);
   if (others.length){
-    $("lockNote").textContent = "Also working on this village: " + others.map(m => `${m.name || "a colleague"} (active ${ago(Date.now() - m.beat)})`).join(", ")
-      + ". Stick to your own range of structures.";
+    $("lockNote").textContent = "Also working on this village: "
+      + others.map(m => `${m.name || "a colleague"} (${m.left ? "just left" : "active " + ago(Date.now() - m.beat)})`).join(", ")
+      + ". Your results are saved to your own results file; the main Excel is updated when you're the only one left.";
     $("lockNote").classList.remove("hidden");
   } else $("lockNote").classList.add("hidden");
+  return others;
 }
-async function claimLock(wb){        // name kept from the old version; it no longer blocks anyone
+async function claimLock(wb){        // name kept from the old version; it never blocks anyone
   S.lockName = wb;
   try{ await writePresence(wb); }catch(e){}
   await showOthers(wb);
   return true;
 }
-async function releaseLock(){
+async function releaseLock(){        // leaving this village: mark "left" so others wait 3 minutes before writing Excel
   if (!S.lockName || !S.root) return;
-  try{ await S.root.removeEntry(presenceFile(S.lockName)); }catch(e){}
+  try{ await writePresence(S.lockName, true); }catch(e){}
   S.lockName = null;
 }
+// Every 4 minutes: refresh my presence; if I'm now the only one here and Excel is missing
+// results (colleagues saved while they were here), merge them in — "the last person updates the sheet".
 async function heartbeat(){
   if (!S.lockName) return;
   try{ await writePresence(S.lockName); }catch(e){}
-  await showOthers(S.lockName);
+  const others = await showOthers(S.lockName);
+  if (!others.length && S.wb){
+    try{
+      const m = await mergeResults();
+      if (m.filled){ syncRecs(m.recs); status("ok", `You're the only one here now — ${m.filled} colleague result${m.filled > 1 ? "s" : ""} merged into <b>${esc(S.wb.name)}</b>.`); }
+    }catch(e){}
+  }
 }
 setInterval(heartbeat, 4 * 60 * 1000);
-window.addEventListener("pagehide", () => { if (S.lockName && S.root) S.root.removeEntry(presenceFile(S.lockName)).catch(() => {}); });
+// closing the tab: best effort "left" note (if it doesn't get written, others wait the full 20 minutes — safe, just slower)
+window.addEventListener("pagehide", () => { if (S.lockName && S.root) writePresence(S.lockName, true).catch(() => {}); });
 
 // Add one result to this person's results file (read it, change one entry, write it back).
 async function saveMyResult(wb, rec, r){
@@ -900,6 +922,15 @@ async function mergeResults(){
   }
   return {filled:fill.length, recs, results, blocked:false};
 }
+// Read-only version for when others are here: read Excel and SHOW colleagues' saved results
+// in the list (in memory only) without writing the Excel file. `waiting` = results not yet in Excel.
+async function readWithResults(){
+  const wb = S.wb.name, results = await allResults(wb);
+  const recs = await parseBook(wb);
+  const fill = missingFromExcel(recs, results);
+  for (const {rec, r} of fill) Object.assign(rec, {verified:r.verified, remarks:r.remarks ?? "", category:r.category || rec.category, year:r.year != null ? String(r.year) : rec.year});
+  return {recs, results, waiting:fill.length};
+}
 
 function syncRecs(recs){
   for (const r of recs){
@@ -912,19 +943,26 @@ async function reloadBook(){
   if (!S.wb) return;
   const keep = S.cur && S.cur.id;
   if (!confirmLeave()) return;
-  // merge everyone's results into Excel first, then show what's there
+  // alone: merge everyone's results into Excel, then show it.
+  // others here: only SHOW their results (Excel is left to whoever ends up alone).
+  const others = S.lockName ? await showOthers(S.lockName) : [];
   let m;
-  try{ m = await mergeResults(); syncRecs(m.recs); }catch(e){ status("err", `Couldn't reload: ${esc(e.message)}`); return; }
+  try{ m = others.length ? await readWithResults() : await mergeResults(); syncRecs(m.recs); }
+  catch(e){ status("err", `Couldn't reload: ${esc(e.message)}`); return; }
   await indexFolders();
-  if (S.lockName) await showOthers(S.lockName);
   if (keep){ S.cur = null; await openStructure(keep); }
   status(m.blocked ? "warn" : "ok", "Reloaded from the folder — colleagues' latest marks are shown."
     + (m.filled ? ` ${m.filled} result${m.filled > 1 ? "s" : ""} merged into Excel.` : "")
+    + (m.waiting ? ` ${m.waiting} result${m.waiting > 1 ? "s are" : " is"} saved but not in Excel yet — it's updated when only one person is left.` : "")
     + (m.blocked ? ` Some results aren't in Excel yet because <b>${esc(S.wb.name)}</b> is open in Excel — close it and click Reload again.` : ""));
 }
 // "Merge now" (⋯ menu): the same merge on demand, e.g. before sending the Excel file to someone.
+// If colleagues are here it asks first, because two computers writing Excel can create a copy in My Drive.
 async function mergeNow(){
   if (!S.wb){ status("err", "Open a workbook first."); return; }
+  const others = await othersHere(S.wb.name);
+  if (others.length && !confirm(`${others.map(m => m.name || "A colleague").join(", ")} ${others.length > 1 ? "are" : "is"} also working on this village.\n\n`
+      + `Merging now can make Google Drive save a copy of the Excel file in someone's My Drive.\n\nMerge anyway?`)) return;
   status("warn", "Merging everyone's results into Excel…");
   let m;
   try{ m = await mergeResults(); syncRecs(m.recs); }catch(e){ status("err", `Couldn't merge: ${esc(e.message)}`); return; }
@@ -1188,7 +1226,9 @@ async function done(){
   const missing = S.items.filter(x => !x.date).length;
   if (missing){ status("err", `Add the imagery date for ${missing} screenshot${missing > 1 ? "s" : ""} first.`); return; }
   // Excel open? (Excel leaves a "~$" lock file next to the workbook)
-  if (await exists(S.root, "~$" + S.wb.name)){ status("err", `<b>${esc(S.wb.name)}</b> is open in Excel — on this computer or a colleague's. Close it, then click <b>Done</b> again — nothing you entered here is lost.`); return; }
+  // anyone else working on this village (or who left < 3 min ago)? Then this Done does NOT write the main Excel.
+  const others = await othersHere(S.wb.name);
+  if (!others.length && await exists(S.root, "~$" + S.wb.name)){ status("err", `<b>${esc(S.wb.name)}</b> is open in Excel — on this computer or a colleague's. Close it, then click <b>Done</b> again — nothing you entered here is lost.`); return; }
   // the list order as you see it now — "next" is the next unchecked structure BELOW this one
   const order = visible().map(r => r.id);
   // planned file names, and a check before replacing anything
@@ -1210,12 +1250,16 @@ async function done(){
     //    later overwrites the Excel file
     try{ await saveMyResult(S.wb.name, rec, {verified, remarks, category, year:newYear}); }
     catch(e){ status("err", `Couldn't save your results file (${esc(e.message)}). Click <b>Done</b> again — nothing you entered here is lost.`); return; }
-    // 2) colleagues' results that the Excel file is missing (a lost save) go into the same Excel write
+    // 2) colleagues' results that the Excel file is missing
     let fill = [];
     try{ fill = missingFromExcel(await parseBook(S.wb.name), await allResults(S.wb.name)).filter(f => f.rec.id !== rec.id); }catch(e){}
-    const extra = fill.map(({rec:x, r}) => ({rec:x, verified:r.verified, remarks:r.remarks ?? "", category:r.category ?? "", year:r.year ?? null}));
-    try{ await writeExcel(rec, verified, remarks, category, newYear, extra); }
-    catch(e){ status("err", `Couldn't save to <b>${esc(S.wb.name)}</b> (${esc(e.message)}). If it's open in Excel, close it and click <b>Done</b> again — nothing you entered here is lost.`); return; }
+    // 3) the main Excel: only when you're the only one here (yours + everyone's missing results in ONE write).
+    //    With colleagues here it is left alone — whoever ends up alone writes it (next Done or within 4 minutes).
+    if (!others.length){
+      const extra = fill.map(({rec:x, r}) => ({rec:x, verified:r.verified, remarks:r.remarks ?? "", category:r.category ?? "", year:r.year ?? null}));
+      try{ await writeExcel(rec, verified, remarks, category, newYear, extra); }
+      catch(e){ status("err", `Couldn't save to <b>${esc(S.wb.name)}</b> (${esc(e.message)}). If it's open in Excel, close it and click <b>Done</b> again — nothing you entered here is lost.`); return; }
+    }
     // the list shows the merged rows as checked too, so "next" skips structures a colleague already did
     for (const {rec:x, r} of fill){ const cur = S.byId.get(x.id); if (cur) Object.assign(cur, {verified:r.verified, remarks:r.remarks ?? "", category:r.category || cur.category, year:r.year != null ? String(r.year) : cur.year}); }
     const catChanged = category !== String(rec.category || "").trim();
@@ -1237,10 +1281,13 @@ async function done(){
     if (S.dir){ status("warn", "Making the PDF…"); pdf = await buildPdf(rec); }
 
     renderList(); await refreshThumbs();
-    const parts = [`Excel updated (${esc(verified)}${catChanged ? `, category → ${esc(category)}` : ""}${newYear != null ? `, year appeared → ${esc(newYear)}` : ""})`];
+    const what = `${esc(verified)}${catChanged ? `, category → ${esc(category)}` : ""}${newYear != null ? `, year appeared → ${esc(newYear)}` : ""}`;
+    const parts = [others.length
+      ? `saved to your results file (${what}) — Excel is updated when you're the only one left, as ${others.map(m => esc(m.name || "a colleague")).join(", ")} ${others.length > 1 ? "are" : "is"} also working`
+      : `Excel updated (${what})`];
     if (saved) parts.push(`${saved} screenshot${saved > 1 ? "s" : ""} saved`);
     if (pdf) parts.push(`${esc(pdf)} made`);
-    if (fill.length) parts.push(`${fill.length} earlier result${fill.length > 1 ? "s" : ""} that Excel had lost restored`);
+    if (fill.length && !others.length) parts.push(`${fill.length} earlier saved result${fill.length > 1 ? "s" : ""} merged into Excel`);
     const msg = `✓ ${esc(rec.id)}: ` + parts.join(" · ") + ".";
     // next unchecked structure BELOW this one in the list — never jumps back up to a colleague's range
     // (if this structure wasn't in the visible list, e.g. hidden by a search, use the full list order)
